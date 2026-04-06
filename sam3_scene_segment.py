@@ -440,6 +440,61 @@ def labels_to_sam3_prompt(labels, label_counts=None):
 # Stage 2 – SAM3 video segmentation
 # ---------------------------------------------------------------------------
 
+def _run_single_label_session(predictor, input_path, label, anchor_frame,
+                               threshold, frame_stems, orig_h, orig_w):
+    """
+    Run one complete SAM3 session for a single label.
+
+    Returns
+    -------
+    dict[int, dict[int, np.ndarray]]
+        frame_idx → {local_obj_id → binary_mask (H, W bool)}
+    Also returns updated (orig_h, orig_w) in case they were None on entry.
+    """
+    response   = predictor.handle_request({
+        "type":          "start_session",
+        "resource_path": str(input_path),
+    })
+    session_id = response["session_id"]
+
+    predictor.handle_request({
+        "type":               "add_prompt",
+        "session_id":         session_id,
+        "frame_index":        anchor_frame,
+        "text":               label,
+        "output_prob_thresh": threshold,
+    })
+
+    session_masks = {}   # frame_idx → {local_obj_id → binary_mask}
+    total_detections = 0
+
+    for result in predictor.handle_stream_request({
+        "type":                  "propagate_in_video",
+        "session_id":            session_id,
+        "propagation_direction": "both",
+        "output_prob_thresh":    threshold,
+    }):
+        frame_idx    = result["frame_index"]
+        outputs      = result["outputs"]
+        obj_ids      = outputs["out_obj_ids"]
+        binary_masks = outputs["out_binary_masks"]
+
+        if orig_h is None and len(binary_masks) > 0:
+            orig_h, orig_w = binary_masks.shape[-2], binary_masks.shape[-1]
+
+        n = len(obj_ids)
+        total_detections += n
+        if n > 0:
+            session_masks[frame_idx] = {
+                int(oid): binary_masks[i].astype(bool)
+                for i, oid in enumerate(obj_ids)
+            }
+
+    predictor.handle_request({"type": "close_session", "session_id": session_id})
+    print(f"    label '{label}': {total_detections} total detections across all frames")
+    return session_masks, orig_h, orig_w
+
+
 def segment_with_sam3(
     input_path,
     output_dir,
@@ -451,16 +506,19 @@ def segment_with_sam3(
     version="sam3.1",
 ):
     """
-    Run the SAM3 video predictor on *input_path* using *prompt*.
+    Run one SAM3 session per label in *prompt*, then merge all results.
 
-    The SAM3 memory tracker assigns stable integer IDs: the same object has
-    the same ID in every output mask, regardless of frame index.
+    Each label gets a clean single-word CLIP embedding → reliable detection.
+    Per-session local IDs are offset into globally unique IDs before merging.
+    On overlapping pixels the session with higher Florence-2 frequency (i.e.
+    the label that appears first in the comma-separated prompt) wins.
 
     Parameters
     ----------
     input_path    : directory of frames OR path to an MP4/AVI/MOV video
-    output_dir    : where to write <stem>_mask.png and <stem>_info.txt
-    prompt        : comma-separated text, e.g. "person, car, dog"
+    output_dir    : where to write gray_mask/ and color_mask/
+    prompt        : comma-separated labels ordered by frequency descending,
+                    e.g. "bicycle, bench, bird"
     threshold     : detector confidence threshold [0, 1]
     anchor_frame  : frame index where the detector fires first (default 0)
     checkpoint_path: local .pt file; None = auto-detect or HF download
@@ -472,7 +530,12 @@ def segment_with_sam3(
     gray_dir.mkdir(parents=True, exist_ok=True)
     color_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── 1. Build SAM3 video predictor ─────────────────────────────────────
+    # Parse comma-separated prompt into ordered label list.
+    labels = [l.strip() for l in prompt.split(",") if l.strip()]
+    if not labels:
+        raise ValueError(f"prompt is empty: {prompt!r}")
+
+    # ── 1. Build SAM3 predictor (shared across all sessions) ──────────────
     print(f"  Building SAM3 {version} video predictor …")
     from sam3.model_builder import build_sam3_predictor
 
@@ -485,24 +548,15 @@ def segment_with_sam3(
     )
     print("  Predictor ready.")
 
-    # ── 2. Start session ──────────────────────────────────────────────────
-    print("  Loading frames into SAM3 session …")
-    response   = predictor.handle_request({
-        "type":          "start_session",
-        "resource_path": str(input_path),
-    })
-    session_id = response["session_id"]
-
-    # Build stem lookup so output filenames match input frame names.
+    # ── 2. Resolve frame stems and dimensions ─────────────────────────────
     input_obj = Path(input_path)
     if input_obj.is_dir():
-        frame_paths  = _sorted_frame_paths(input_path)
-        frame_stems  = [p.stem for p in frame_paths]
-        # Read dimensions from first frame.
+        frame_paths = _sorted_frame_paths(input_path)
+        frame_stems = [p.stem for p in frame_paths]
         with Image.open(frame_paths[0]) as _img:
             orig_w, orig_h = _img.size
     else:
-        frame_stems = None           # video file → use index-based names
+        frame_stems = None
         orig_h = orig_w = None
         try:
             import cv2 as _cv2
@@ -513,71 +567,95 @@ def segment_with_sam3(
         except Exception:
             pass
 
-    # ── 3. Add text prompt on anchor frame ────────────────────────────────
-    print(f"  Prompting anchor frame {anchor_frame} with: {prompt!r}")
-    predictor.handle_request({
-        "type":               "add_prompt",
-        "session_id":         session_id,
-        "frame_index":        anchor_frame,
-        "text":               prompt,
-        "output_prob_thresh": threshold,
-    })
+    # ── 3. Run one session per label, collect masks in memory ─────────────
+    # all_sessions: list of per-label dicts {frame_idx → {local_id → mask}}
+    # ordered by label priority (first = highest Florence frequency = wins overlap)
+    all_sessions = []
+    for i, label in enumerate(labels):
+        print(f"  [{i+1}/{len(labels)}] Running session for label: '{label}' …")
+        session_masks, orig_h, orig_w = _run_single_label_session(
+            predictor, input_path, label, anchor_frame,
+            threshold, frame_stems, orig_h, orig_w,
+        )
+        all_sessions.append(session_masks)
 
-    # ── 4. Propagate and save ─────────────────────────────────────────────
-    print("  Propagating to all frames …")
+    # ── 4. Assign globally unique IDs across sessions ─────────────────────
+    # local SAM3 IDs start at 0 per session; offset so pixel 0 = background.
+    # Session k's local ID j → global ID = id_offset + j + 1
+    global_sessions = []   # list of {frame_idx → {global_id → mask}}
+    id2label = {}          # global_id (int) → label string
+    id_offset = 0
+    for label, session_masks in zip(labels, all_sessions):
+        # Find max local ID used in this session (0 if no detections).
+        max_local = max(
+            (max(local_ids) for local_ids in session_masks.values() if local_ids),
+            default=-1,
+        )
+        remapped = {}
+        for frame_idx, frame_masks in session_masks.items():
+            remapped[frame_idx] = {}
+            for local_id, mask in frame_masks.items():
+                global_id = id_offset + local_id + 1
+                remapped[frame_idx][global_id] = mask
+                id2label[global_id] = label   # same label for all instances
+        global_sessions.append(remapped)
+        id_offset += max_local + 1   # reserve IDs used by this session
 
-    for result in predictor.handle_stream_request({
-        "type":                  "propagate_in_video",
-        "session_id":            session_id,
-        "propagation_direction": "both",
-        "output_prob_thresh":    threshold,
-    }):
-        frame_idx    = result["frame_index"]
-        outputs      = result["outputs"]
-        obj_ids      = outputs["out_obj_ids"]       # np.ndarray [N] int
-        binary_masks = outputs["out_binary_masks"]  # np.ndarray [N, H, W] bool
-        probs        = outputs["out_probs"]         # np.ndarray [N] float
-        boxes_xywh   = outputs["out_boxes_xywh"]   # np.ndarray [N, 4] norm. XYWH
+    # ── 5. Merge sessions per frame and write outputs ─────────────────────
+    # Determine full frame index range.
+    if frame_stems is not None:
+        all_frame_indices = list(range(len(frame_stems)))
+    else:
+        all_frame_indices = sorted({
+            fi for gs in global_sessions for fi in gs
+        })
 
-        # Fall back to mask shape if dimensions weren't obtained above.
-        if orig_h is None and len(binary_masks) > 0:
-            orig_h, orig_w = binary_masks.shape[-2], binary_masks.shape[-1]
+    print(f"  Merging {len(labels)} session(s) across {len(all_frame_indices)} frame(s) …")
 
+    total_written = 0
+    for frame_idx in all_frame_indices:
         stem = (frame_stems[frame_idx]
                 if frame_stems and frame_idx < len(frame_stems)
                 else f"frame_{frame_idx:05d}")
 
-        n = len(obj_ids)
-        print(f"    frame {frame_idx:5d}: {n} object(s) "
-              f"ids={list(obj_ids[:8])}{'…' if n > 8 else ''}")
+        h = orig_h or 1
+        w = orig_w or 1
+        id_img = np.zeros((h, w), dtype=np.uint16)
 
-        # Build ID image.
-        if n == 0 or orig_h is None:
-            h, w   = (orig_h or 1), (orig_w or 1)
-            id_img = np.zeros((h, w), dtype=np.uint16)
-        else:
-            id_img = _build_id_image(
-                obj_ids, binary_masks, orig_h, orig_w,
-                non_overlap=non_overlap,
-            )
+        # Paint sessions in priority order (first = highest frequency).
+        # First-session-wins: only paint unclaimed pixels (id_img == 0).
+        for gs in global_sessions:
+            if frame_idx not in gs:
+                continue
+            for global_id, mask in gs[frame_idx].items():
+                if mask.shape != (h, w):
+                    mask = mask[-h:, -w:]   # crop if shape mismatch
+                if non_overlap:
+                    id_img[mask & (id_img == 0)] = global_id
+                else:
+                    id_img[mask & (id_img == 0)] = global_id
 
-        # Save 16-bit grayscale mask.
-        Image.fromarray(id_img).save(str(gray_dir / f"{stem}_mask.png"))
+        n_objects = len(np.unique(id_img)) - 1   # exclude background 0
+        if total_written < 5 or n_objects > 0:
+            print(f"    frame {frame_idx:5d}: {n_objects} object(s)")
 
-        # Save RGB color mask.
+        Image.fromarray(id_img).save(str(gray_dir / f"{stem}.png"))
         Image.fromarray(_id_image_to_color(id_img)).save(
             str(color_dir / f"{stem}_mask.png")
         )
+        total_written += 1
 
-        # Save TSV info.
-        if n > 0 and orig_h is not None:
-            _save_info_txt(
-                gray_dir / f"{stem}_info.txt",
-                obj_ids, probs, boxes_xywh, orig_h, orig_w,
-            )
+    # ── 6. Write id2label.json ────────────────────────────────────────────
+    import json
+    id2label_path = Path(output_dir) / "id2label.json"
+    with id2label_path.open("w") as f:
+        # Keys must be strings in JSON; sort numerically for readability.
+        json.dump({str(k): v for k, v in sorted(id2label.items())}, f, indent=2)
+    print(f"  id2label.json → {id2label_path}")
 
-    predictor.handle_request({"type": "close_session", "session_id": session_id})
-    print(f"  Done → gray_mask: {gray_dir}  color_mask: {color_dir}")
+    print(f"  Done → {total_written} frame(s) written")
+    print(f"         gray_mask : {gray_dir}")
+    print(f"         color_mask: {color_dir}")
 
 
 # ---------------------------------------------------------------------------
