@@ -546,6 +546,13 @@ class Sam3VideoInference(Sam3VideoBase):
                 if obj_id in filtered_obj_id_to_mask:
                     del filtered_obj_id_to_mask[obj_id]
 
+        # Offload cached masks to CPU to prevent GPU memory accumulating over all frames.
+        # These masks are at original video resolution [1, H, W] and grow linearly with
+        # frame count; keeping them on GPU causes OOM near the end of long videos.
+        filtered_obj_id_to_mask = {
+            k: v.cpu() if isinstance(v, torch.Tensor) else v
+            for k, v in filtered_obj_id_to_mask.items()
+        }
         inference_state["cached_frame_outputs"][frame_idx] = filtered_obj_id_to_mask
 
     def _build_tracker_output(

@@ -4,20 +4,29 @@ SAM3 Scene Auto-Segmenter
 Two-stage pipeline for automatic segmentation with consistent cross-frame object IDs.
 
   Stage 1 — Vocabulary Discovery  (Florence-2-base, ~230 MB)
-      Samples every N frames from the input sequence and runs Florence-2's
-      zero-prompt object-detection task (<OD>) to find what objects are
-      present in the scene.  The discovered labels are formatted into a
-      SAM3-compatible period-separated text prompt.
+      Samples every N frames from the input and runs Florence-2's zero-prompt
+      object-detection task (<OD>) to discover what objects are present.
+      Labels that appear in fewer than --min_label_freq of sampled frames are
+      discarded as transient noise.  The top --max_labels labels (by frequency)
+      are kept and written to <output_dir>/florence2_labels.txt.
+      Skip this stage entirely by supplying --prompt explicitly.
 
   Stage 2 — Video Segmentation  (SAM3 / SAM3.1 video predictor)
-      Uses the discovered prompt (or an explicit --prompt if provided) with
-      the SAM3 video predictor and memory tracker so the same physical object
-      keeps the SAME ID across all frames.
+      Runs one SAM3 session per label so each label gets a clean, single-word
+      CLIP embedding (multi-label prompts dilute the embedding and hurt recall).
+      Results are merged in memory: globally unique IDs are assigned across all
+      per-label sessions (pixel 0 is always background).  When two sessions
+      claim the same pixel, the label with higher Florence-2 frequency wins.
 
-Output (per frame)
-------------------
-  <stem>_mask.png  – 16-bit grayscale PNG, pixel value = object ID (0 = background)
-  <stem>_info.txt  – TSV: id | score | x0 | y0 | x1 | y1  (absolute px)
+Output
+------
+  <output_dir>/
+    gray_mask/<stem>.png        – 16-bit grayscale PNG, pixel value = object ID
+                                   (0 = background, 1…N = detected objects)
+    color_mask/<stem>_mask.png  – RGB false-colour visualisation for inspection
+    id2label.json               – JSON mapping {"1": "bicycle", "2": "bench", …}
+    florence2_labels.txt        – raw Florence-2 discovery report with per-label
+                                   frame counts and the final prompt (Stage 1 only)
 
 Usage
 -----
@@ -28,22 +37,73 @@ Usage
   # Explicit prompt (skip Florence-2):
   python sam3_scene_segment.py \\
       --input_dir /path/to/frames --output_dir /out \\
-      --prompt "person, car, bicycle"
+      --prompt "bicycle, bench, person"
 
   # From a video file:
   python sam3_scene_segment.py \\
       --input_video clip.mp4 --output_dir /out
 
+  # SAM3.1 model with a local checkpoint:
+  python sam3_scene_segment.py \\
+      --input_dir /path/to/frames --output_dir /out \\
+      --version sam3.1 --checkpoint ckpt/sam3.1_multiplex.pt
+
+Arguments
+---------
+Input (mutually exclusive, one required):
+  --input_dir DIR       Directory of JPEG/PNG frames sorted numerically/lexicographically.
+  --input_video FILE    Path to an MP4/AVI/MOV video file.
+
+Output:
+  --output_dir DIR      Directory where all outputs are written (created if absent).
+
+Stage 1 — Florence-2 vocabulary discovery:
+  --prompt TEXT         Comma-separated labels, e.g. "bicycle, bench, person".
+                        Providing this skips Florence-2 entirely.
+  --vocab_stride N      Sample every N-th frame for discovery.
+                        Default: 5 for image directories, 30 for video files.
+  --vocab_device DEV    Device for Florence-2: "cuda", "cpu", or omit for auto
+                        (uses CUDA when available).
+  --min_label_frames N  A label must appear in at least N sampled frames to be
+                        kept (default: 1).  Raise to filter one-off detections.
+  --min_label_freq F    A label must appear in at least F fraction of sampled
+                        frames to be kept (default: 0.25 = 25 %).
+                        Combines with --min_label_frames (both must pass).
+  --max_labels N        Keep only the top N labels by frequency (default: 6).
+
+Stage 2 — SAM3 segmentation:
+  --threshold T         Detector confidence threshold 0–1 (default: 0.3).
+                        Lower values detect more objects but increase false positives.
+  --anchor_frame N      Frame index where the detector fires first (default: 0).
+                        Objects that appear only after this frame are still tracked
+                        because allow_new_detections is active on every frame.
+  --checkpoint FILE     Path to a local .pt checkpoint.
+                        Auto-detection order: ckpt/sam3.pt (or sam3.1_multiplex.pt)
+                        beside the script → HuggingFace download.
+  --non_overlap         If set, each pixel is assigned to at most one object.
+                        By default, overlapping masks are allowed.
+  --version {sam3,sam3.1}
+                        Model version to use (default: sam3).
+                        sam3   — single-GPU dense tracker, uses sam3.pt.
+                        sam3.1 — multiplex tracker, uses sam3.1_multiplex.pt,
+                                 generally higher quality but requires more VRAM.
+
 Requirements
 ------------
   pip install -e ".[notebooks]"
-  pip install "transformers>=4.38"   # for Florence-2
-  pip install opencv-python          # only needed for --input_video
+  pip install "transformers>=4.41,<4.45"  # Florence-2 (built-in, no trust_remote_code)
+  # opencv is required for --input_video; install via conda or pip install opencv-python
 """
 
 import argparse
 import gc
+import os
 from pathlib import Path
+
+# Must be set before torch is imported to take effect.
+# Reduces CUDA memory fragmentation so reserved-but-unallocated blocks can
+# satisfy large allocations without triggering an OOM.
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
 import numpy as np
 import torch
@@ -260,8 +320,8 @@ def discover_vocabulary(
     every_n=5,
     device=None,
     min_label_frames=1,
-    min_label_freq=0.30,
-    top_n=4,
+    min_label_freq=0.25,
+    top_n=6,
 ):
     """
     Sample frames from *input_path* (directory or video file) and run
@@ -452,8 +512,9 @@ def _run_single_label_session(predictor, input_path, label, anchor_frame,
     Also returns updated (orig_h, orig_w) in case they were None on entry.
     """
     response   = predictor.handle_request({
-        "type":          "start_session",
-        "resource_path": str(input_path),
+        "type":                 "start_session",
+        "resource_path":        str(input_path),
+        "offload_video_to_cpu": True,
     })
     session_id = response["session_id"]
 
@@ -491,6 +552,8 @@ def _run_single_label_session(predictor, input_path, label, anchor_frame,
             }
 
     predictor.handle_request({"type": "close_session", "session_id": session_id})
+    gc.collect()
+    torch.cuda.empty_cache()
     print(f"    label '{label}': {total_detections} total detections across all frames")
     return session_masks, orig_h, orig_w
 
@@ -545,6 +608,7 @@ def segment_with_sam3(
         version=version,
         use_fa3=False,
         async_loading_frames=True,
+        max_num_objects=200,
     )
     print("  Predictor ready.")
 
@@ -731,18 +795,18 @@ def _parse_args():
     p.add_argument(
         "--min_label_freq",
         type=float,
-        default=0.30,
+        default=0.25,
         metavar="F",
         help=(
             "(Stage 1) Minimum fraction of sampled frames a label must appear in "
-            "to be kept (default: 0.30 = 30%%).  Labels seen in fewer frames are "
+            "to be kept (default: 0.20 = 20%%).  Labels seen in fewer frames are "
             "treated as transient noise and discarded."
         ),
     )
     p.add_argument(
         "--max_labels",
         type=int,
-        default=4,
+        default=6,
         metavar="N",
         help=(
             "(Stage 1) Maximum number of categories passed to SAM3 (default: 4). "

@@ -680,6 +680,7 @@ def build_sam3_video_model(
     apply_temporal_disambiguation: bool = True,
     device="cuda" if torch.cuda.is_available() else "cpu",
     compile=False,
+    max_num_objects: int = -1,
 ) -> Sam3VideoInferenceWithInstanceInteractivity:
     """
     Build SAM3 dense tracking model.
@@ -759,6 +760,7 @@ def build_sam3_video_model(
             image_mean=(0.5, 0.5, 0.5),
             image_std=(0.5, 0.5, 0.5),
             compile_model=compile,
+            max_num_objects=max_num_objects,
         )
     else:
         # a version without any heuristics for ablation studies
@@ -1305,6 +1307,7 @@ def build_sam3_predictor(
             bpe_path=bpe_path,
             compile=compile,
             async_loading_frames=async_loading_frames,
+            max_num_objects=max_num_objects,
             **kwargs,
         )
     else:
